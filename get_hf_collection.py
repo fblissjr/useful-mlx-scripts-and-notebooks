@@ -2,9 +2,8 @@
 """
 HuggingFace Collection Downloader CLI
 
-A reliable tool to download all models from a HuggingFace collection using the
-official huggingface_hub library. This version explicitly handles public collections
-for both fetching and downloading to avoid authentication issues from bad local tokens.
+Downloads all models from a HuggingFace collection into clean, separate local directories
+for each model, not as a cache.
 """
 
 import os
@@ -50,7 +49,7 @@ class CollectionDownloader:
         auth_token = True if use_auth else False
         if not use_auth:
             self.logger.info("Attempting to access collection publicly. No token will be sent.")
-
+        
         try:
             collection = get_collection(collection_slug, token=auth_token)
             self.logger.info(f"✅ Successfully fetched collection: '{collection.title}'")
@@ -60,13 +59,12 @@ class CollectionDownloader:
                 return []
             self.logger.info(f"Found {len(model_ids)} models in the collection.")
             return model_ids
-
+            
         except HfHubHTTPError as e:
             if e.response.status_code == 401:
-                self.logger.error("❌ Authentication failed (401 Unauthorized).")
-                self.logger.error("💡 If this is a private collection, please use the --use-auth-token flag and run 'huggingface-cli login'.")
+                self.logger.error("❌ Authentication failed. If this is a private collection, use --use-auth-token and run 'huggingface-cli login'.")
             elif e.response.status_code == 404:
-                self.logger.error(f"❌ Collection not found (404). Please check the URL or slug.")
+                self.logger.error(f"❌ Collection not found. Please check the URL or slug.")
             else:
                 self.logger.error(f"❌ An HTTP error occurred: {e}")
             return None
@@ -74,21 +72,22 @@ class CollectionDownloader:
             self.logger.error(f"❌ An unexpected error occurred while fetching the collection: {e}")
             return None
 
-    def download_model(
-        self, model_id: str, storage_dir: str, use_auth: bool, allow_patterns: Optional[List[str]] = None
+    def download_model_to_local_dir(
+        self, model_id: str, local_dir: Path, use_auth: bool, allow_patterns: Optional[List[str]] = None
     ) -> bool:
-        """Downloads a single model repository."""
+        """Downloads a model directly to a specified local directory."""
         self.logger.info(f"📥 Starting download for: {model_id}")
-
-        # --- THE FINAL FIX ---
-        # Apply the same token logic to snapshot_download.
+        self.logger.info(f"   Target directory: {local_dir}")
         auth_token = True if use_auth else False
-
+        
         try:
+            # --- THE CRUCIAL CHANGE ---
+            # Use `local_dir` to download files directly, not `cache_dir`.
             snapshot_download(
                 repo_id=model_id,
-                token=auth_token, # This tells the function to ignore local tokens if False
-                cache_dir=storage_dir,
+                local_dir=str(local_dir),
+                local_dir_use_symlinks=False, # Ensures a true copy, not symlinks
+                token=auth_token,
                 allow_patterns=allow_patterns,
                 resume_download=True,
                 user_agent=f"hf-collection-downloader/1.0",
@@ -107,41 +106,48 @@ class CollectionDownloader:
 # --- Main Execution ---
 def main():
     parser = argparse.ArgumentParser(
-        description="Download all models from a HuggingFace collection.",
+        description="Download all models from a HuggingFace collection into clean local directories.",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument("collection", help="The full URL or slug of the HuggingFace collection.")
-    parser.add_argument("-d", "--download-dir", help="Directory to download models to.", default=None)
-    parser.add_argument("-f", "--file-patterns", nargs="*", help="Optional file patterns to download.", default=None)
-    parser.add_argument("--dry-run", action="store_true", help="List models without downloading.")
-    parser.add_argument("--use-auth-token", action="store_true", help="Force the use of the machine's Hugging Face token (for private items).")
+    parser.add_argument("-d", "--download-dir", help="The base directory to save model folders into.", default=".")
+    parser.add_argument("-f", "--file-patterns", nargs="*", help="Optional file patterns to download (e.g., \"*.safetensors\").", default=None)
+    parser.add_argument("--dry-run", action="store_true", help="List models and their target directories without downloading.")
+    parser.add_argument("--use-auth-token", action="store_true", help="Force use of the machine's HF token (for private items).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose (debug) logging.")
     args = parser.parse_args()
-
+    
     logger = setup_logging(args.verbose)
     downloader = CollectionDownloader(logger)
-
+    
     collection_slug = downloader.extract_slug_from_url(args.collection)
     model_ids = downloader.get_model_ids_from_collection(collection_slug, use_auth=args.use_auth_token)
 
     if model_ids is None: sys.exit(1)
-    if not model_ids: sys.exit(0)
-
-    if args.dry_run:
-        logger.info("--- 🔍 DRY RUN MODE ---")
-        logger.info(f"The following {len(model_ids)} models would be downloaded:")
-        for i, model_id in enumerate(model_ids, 1): print(f"  {i:2d}. {model_id}")
+    if not model_ids:
+        logger.info("No models to download. Exiting.")
         sys.exit(0)
 
-    storage_dir = Path(args.download_dir or collection_slug.replace("/", "_") + "_models")
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"🚀 Models will be downloaded to: {storage_dir.resolve()}")
+    # Determine the main storage directory
+    base_storage_dir = Path(args.download_dir)
+    base_storage_dir.mkdir(parents=True, exist_ok=True)
+    
+    if args.dry_run:
+        logger.info("--- 🔍 DRY RUN MODE ---")
+        logger.info(f"The following {len(model_ids)} models would be downloaded into subdirectories inside '{base_storage_dir.resolve()}':")
+        for i, model_id in enumerate(model_ids, 1):
+            target_dir = base_storage_dir / model_id
+            print(f"  {i:2d}. {model_id} -> {target_dir}/")
+        sys.exit(0)
 
+    logger.info(f"🚀 Models will be downloaded into subdirectories inside: {base_storage_dir.resolve()}")
+    
     successful, failed = [], []
     for i, model_id in enumerate(model_ids, 1):
-        logger.info("-" * 40 + f"\nProcessing model {i}/{len(model_ids)}: {model_id}")
-        # Pass the authentication flag down to the download function
-        if downloader.download_model(model_id, str(storage_dir), args.use_auth_token, args.file_patterns):
+        logger.info("-" * 40 + f"\nProcessing model {i}/{len(model_ids)}")
+        # Define a clean local directory for each model
+        model_target_dir = base_storage_dir / model_id
+        if downloader.download_model_to_local_dir(model_id, model_target_dir, args.use_auth_token, args.file_patterns):
             successful.append(model_id)
         else:
             failed.append(model_id)
